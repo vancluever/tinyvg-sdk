@@ -1,4 +1,3 @@
-//!
 //! This module implements means to render the output of the parsing module.
 //!
 
@@ -83,7 +82,9 @@ pub fn renderStream(
     // Fill the destination buffer with magic magenta. None if this will be visible
     // in the end, but it will show users where they do wrong alpha interpolation
     // by bleeding in magenta
-    @memset(framebuffer.slice, Color{ .r = 1, .g = 0, .b = 1, .a = 0 });
+    // @memset(framebuffer.slice, Color{ .r = 1, .g = 0, .b = 1, .a = 0 });
+
+    @memset(framebuffer.slice, Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
 
     while (try parser.next()) |cmd| {
         try renderCommand(&framebuffer, parser.header, parser.color_table, cmd, temporary_allocator);
@@ -141,7 +142,8 @@ pub fn renderStream(
                 .a = @intFromFloat(255.0 * color[3]),
             };
         } else {
-            pixel.* = Color8{ .r = 0xFF, .g = 0x00, .b = 0xFF, .a = 0x00 };
+            // pixel.* = Color8{ .r = 0xFF, .g = 0x00, .b = 0xFF, .a = 0x00 };
+            pixel.* = Color8{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0x00 };
         }
     }
 
@@ -320,6 +322,8 @@ pub fn renderCommand(
             }
         },
         .fill_path => |data| {
+            std.debug.assert(allocator != null);
+
             var point_store = FixedBufferList(Point, temp_buffer_size).init(allocator);
             defer point_store.deinit();
             var slice_store = FixedBufferList(IndexSlice, temp_buffer_size).init(allocator);
@@ -332,12 +336,12 @@ pub fn renderCommand(
                 slices[i] = point_store.items()[src.offset..][0..src.len];
             }
 
-            painter.fillPolygonList(
+            try painter.fillPolygonList2(
+                allocator.?,
                 framebuffer,
                 color_table,
                 data.style,
                 slices[0..slice_store.items().len],
-                .even_odd,
             );
         },
         .draw_lines => |data| {
@@ -930,6 +934,115 @@ const Painter = struct {
                 if (set) {
                     framebuffer.setPixel(x, y, self.sampleStlye(color_table, style, x, y));
                 }
+            }
+        }
+    }
+
+    /// Fills a list of polygons using scanline fill. Sorts and scales points
+    /// first, then draws according to even-odd rule.
+    fn fillPolygonList2(
+        self: Painter,
+        allocator: std.mem.Allocator,
+        framebuffer: anytype,
+        color_table: []const Color,
+        style: Style,
+        polygons: []const []const Point,
+    ) !void {
+        // Should never be run for 0 polys
+        std.debug.assert(polygons.len > 0);
+
+        // Find our draw area, scaled to the viewport.
+        var min_x: usize = std.math.maxInt(i16);
+        var min_y: usize = std.math.maxInt(i16);
+        var max_x: usize = 0;
+        var max_y: usize = 0;
+
+        for (polygons) |poly| {
+            // NOTE: This should never be less than 3 points, otherwise we had
+            // an unclosed path versus a polygon, and we can't fill it.
+            std.debug.assert(poly.len >= 3);
+
+            for (poly) |pt| {
+                const x: usize = @intFromFloat(@floor(self.scale_x * pt.x));
+                const y: usize = @intFromFloat(@floor(self.scale_y * pt.y));
+
+                min_x = @min(min_x, x);
+                min_y = @min(min_y, y);
+                max_x = @max(max_x, x);
+                max_y = @max(max_y, y);
+            }
+        }
+
+        // Limit our draw area to valid screen area.
+        std.log.debug("min_x: {} min_y: {} max_x: {} max_y: {}", .{ min_x, min_y, max_x, max_y });
+        min_x = @max(min_x, 0);
+        min_y = @max(min_y, 0);
+        max_x = @min(max_x, framebuffer.width - 1);
+        max_y = @min(max_y, framebuffer.height - 1);
+
+        // Start scanning.
+        for (min_y..max_y + 1) |y| {
+            // Scanline and P-I-P algorithms as seen on
+            // http://alienryderflex.com/polygon_fill/.
+            var edge_list = std.ArrayList(i16).init(allocator);
+            defer edge_list.deinit();
+
+            // We collect the edges for every polygon on the same line, so
+            // iterate through every polygon here.
+            for (polygons) |poly| {
+                // Last point, to compare against current point
+                var last_idx = poly.len - 1;
+                for (0..poly.len) |cur_idx| {
+                    // Scale down, also set up our line as a float
+                    const last_y = self.scale_y * poly[last_idx].y;
+                    const cur_y = self.scale_y * poly[cur_idx].y;
+                    const line_y: f32 = @floatFromInt(y);
+                    // if (cur_y >= 200 or last_y >= 200) {
+                    //     std.log.debug("? {d} < {d} and {d} >= {d} or {d} >= {d} and {d} < {d}", .{ cur_y, line_y, last_y, line_y, cur_y, line_y, last_y, line_y });
+                    // }
+
+                    // Compare, and append if we're good
+                    if (cur_y < line_y and last_y >= line_y or cur_y >= line_y and last_y < line_y) {
+                        const last_x = self.scale_y * poly[last_idx].x;
+                        const cur_x = self.scale_y * poly[cur_idx].x;
+                        const edge_x: i16 = floatToIntClamped(
+                            i16,
+                            @floor(cur_x + (line_y - cur_y) / (last_y - cur_y) * (last_x - cur_x)),
+                        );
+                        // if (cur_y >= 200 or last_y >= 200) {
+                        //     std.log.debug("cur_y: {d} last_y: {d} cur_x: {d} last_x: {d} edge_x: {d}", .{ cur_y, last_y, cur_x, last_x, edge_x });
+                        // }
+                        try edge_list.append(edge_x);
+                    }
+
+                    last_idx = cur_idx;
+                }
+            }
+
+            // Sort all of our collected edges
+            const edge_list_sorted = try edge_list.toOwnedSlice();
+            defer allocator.free(edge_list_sorted);
+            std.mem.sort(i16, edge_list_sorted, {}, comptime (std.sort.asc(i16)));
+
+            // Now fill in from i..i+1, i+2..i+3, etc.
+            var start_idx: usize = 0;
+            //std.log.debug("y: {} edge_list_sorted.len: {}", .{ y, edge_list_sorted.len });
+            while (start_idx + 1 < edge_list_sorted.len) {
+                const start_x: usize = @max(0, @as(usize, @intCast(edge_list_sorted[start_idx])));
+                const end_x: usize = @max(0, @as(usize, @intCast(edge_list_sorted[start_idx + 1])));
+                //std.log.debug("start_x: {} end_x: {}", .{ start_x, end_x });
+                for (start_x..end_x + 1) |x| {
+                    //std.log.debug("y: {} x: {}, min_x: {} max_x: {}", .{ y, x, min_x, max_x });
+                    if (x < min_x or x > max_x) {
+                        continue;
+                    }
+                    const px: isize = @intCast(x);
+                    const py: isize = @intCast(y);
+                    const cx: i16 = @intCast(x);
+                    const cy: i16 = @intCast(y);
+                    framebuffer.setPixel(px, py, self.sampleStlye(color_table, style, cx, cy));
+                }
+                start_idx += 2;
             }
         }
     }
